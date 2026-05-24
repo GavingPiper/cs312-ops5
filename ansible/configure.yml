@@ -1,0 +1,119 @@
+---
+- name: Configure Minecraft Server on EC2
+  hosts: server
+  become: true
+  vars:
+    ecr_repo_url: "551998408663.dkr.ecr.us-east-1.amazonaws.com/cs312-minecraft-ecr"
+    image_tag: "1.21.1"
+    s3_bucket: "piperga-minecraft"
+    minecraft_dir: "/opt/minecraft"
+
+  tasks:
+    - name: Install prerequisites
+      apt:
+        name: [ca-certificates, curl, gnupg, awscli, amazon-ecr-credential-helper] 
+        state: present
+        update_cache: true
+
+    - name: Check if k3s is installed
+      ansible.builtin.stat:
+        path: /usr/local/bin/k3s
+      register: k3s_binary_result
+
+    - name: Install k3 if not present
+      ansible.builtin.shell:
+        cmd: curl -sfL https://get.k3s.io | sh -
+      when: not k3s_binary_result.stat.exists
+
+    - name: k3s is active
+      ansible.builtin.systemd:
+        name: k3s
+        state: started
+        enabled: yes
+
+    - name: Ensure k3s directory exists for custom configuration templates
+      file:
+        path: /etc/rancher/k3s
+        state: directory
+        mode: '0755'
+
+    - name: Configure k3s containerd template to use the ECR credential helper
+      copy:
+        dest: /etc/rancher/k3s/config.toml.tmpl
+        content: |
+          [plugins."io.containerd.grpc.v1.cri".registry]
+            [plugins."io.containerd.grpc.v1.cri".registry.configs]
+              [plugins."io.containerd.grpc.v1.cri".registry.configs."551998408663.dkr.ecr.us-east-1.amazonaws.com".auth]
+                credential_helper = "ecr-login"
+      register: k3s_config_changed
+
+    - name: Restart k3s to pick up ECR credential helper changes
+      ansible.builtin.systemd:
+        name: k3s
+        state: restarted
+      when: k3s_config_changed.changed
+
+    - name: Create or update Kubernetes ECR secret natively
+      ansible.builtin.shell: |
+        k3s kubectl create secret docker-registry ecr-cred \
+          --docker-server="551998408663.dkr.ecr.us-east-1.amazonaws.com" \
+          --docker-username="AWS" \
+          --docker-password="$(aws ecr get-login-password --region us-east-1)" \
+          --dry-run=client -o yaml | k3s kubectl apply -f -    
+    - name: Create Minecraft directory
+      file:
+        path: "{{ minecraft_dir }}/data"
+        state: directory
+        mode: "0755"
+
+    - name: Restore world data from S3 (Recovery Step)
+      # Idempotent: aws s3 sync only downloads changed/new files
+      command: "aws s3 sync s3://{{ s3_bucket }} {{ minecraft_dir }}/data"
+      changed_when: false
+
+    - name: Set ownership of Minecraft data directory
+      file:
+        path: "{{ minecraft_dir }}/data"
+        owner: "1000"
+        group: "1000"
+        recurse: yes
+
+    - name: Set MOTD
+      lineinfile:
+        path: "{{ minecraft_dir }}/data/server.properties"
+        regexp: '^motd='
+        line: 'motd=Piperga-934433417'
+        create: yes
+
+    - name: Backup current world data to S3
+      command: "aws s3 sync {{ minecraft_dir }}/data s3://{{ s3_bucket }}"
+
+    - name: Copy Kubernetes manifests to the EC2 host
+      ansible.builtin.copy:
+        src: ~/school/cs312/ops4/ansible/k8s/ # Added trailing slash
+        dest: "{{ minecraft_dir }}/manifests" # Shifted to your app directory
+        mode: "0644"
+      become: true
+
+    - name: Apply Kubernetes manifests to the k3s cluster
+      ansible.builtin.shell:
+        cmd: k3s kubectl apply -f "{{ minecraft_dir }}/manifests/"
+      become: true
+
+    - name: Copy the backup script to the EC2 host
+      copy:
+        dest: /usr/local/bin/minecraft-backup.sh
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          DATA_DIR="/var/lib/rancher/k3s/storage/minecraft-storage_minecraft-pvc"
+          BUCKET_NAME="piperga-minecraft"
+          TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+          tar -czf - -C "$DATA_DIR" . | aws s3 cp - "s3://$BUCKET_NAME/backups/world_$TIMESTAMP.tar.gz"
+
+    - name: Schedule the backup script to run every 2 hours
+      cron:
+        name: "Minecraft S3 2-Hour Backup"
+        minute: "0"
+        hour: "*/2"
+        job: "/usr/local/bin/minecraft-backup.sh > /dev/null 2>&1"

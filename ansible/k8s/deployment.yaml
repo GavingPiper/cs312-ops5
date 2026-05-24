@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minecraft
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: minecraft
+  template:
+    metadata:
+      labels:
+        app: minecraft
+    spec:
+      imagePullSecrets:
+        - name: ecr-cred
+      containers:
+        - name: minecraft
+          image: 551998408663.dkr.ecr.us-east-1.amazonaws.com/cs312-minecraft-ecr:1.21.1
+          ports:
+            - containerPort: 25565
+
+          startupProbe:
+            tcpSocket:
+              port: 25565
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 30  # Allows up to 5 minutes to boot (30 * 10s)
+
+          livenessProbe:
+            tcpSocket:
+              port: 25565
+            periodSeconds: 20
+            timeoutSeconds: 5
+
+          readinessProbe:
+            tcpSocket:
+              port: 25565
+            periodSeconds: 15
+            timeoutSeconds: 5
+
+          envFrom:
+            - configMapRef:
+                name: minecraft-config
+          resources:
+            requests:
+              memory: "4Gi"
+              cpu: "500m"
+            limits:
+              memory: "6Gi"
+              cpu: "1000m"
+          volumeMounts:
+            - name: minecraft-storage-volume
+              mountPath: /data
+
+      volumes:
+        - name: minecraft-storage-volume
+          persistentVolumeClaim:
+            claimName: minecraft-pvc
