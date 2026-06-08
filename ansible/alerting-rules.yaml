@@ -1,0 +1,37 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: minecraft-alerts
+  namespace: default
+  labels:
+    release: monitoring
+spec:
+  groups:
+    - name: minecraft-alerts
+      rules:
+        - alert: MinecraftServiceUnreachable
+          expr: absent(kube_pod_container_status_ready{container="minecraft", namespace="default"}) == 1
+          for: 2m
+          labels:
+            severity: page
+          annotations:
+            summary: "Player-Visible Impact: Minecraft game server is unreachable."
+            description: "The Minecraft container in pod {{ $labels.pod }} has failed its readiness/liveness checks for more than 2 minutes."
+
+        - alert: MinecraftPodFrequentRestarts
+          expr: increase(kube_pod_container_status_restarts_total{container="minecraft", namespace="default"}[15m]) >= 2
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Operator Symptom: Intermittent lag and connection drops due to boot loops."
+            description: "The Minecraft container has restarted {{ $value }} times within a rolling 15-minute window."
+
+        - alert: HostDiskSpaceExhaustionCritical
+          expr: (node_filesystem_free_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) * 100 < 15
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Operator Symptom: Impending data loss and game saving failures."
+            description: "Host root disk space has dropped below 15% (Current: {{ $value }}% free)."
